@@ -1,0 +1,215 @@
+<%
+  groups = OodSupport::User.new.groups.map(&:name).drop(1)
+
+  # your image location will differ
+  ppn = num_cores.blank? ? 1 : num_cores.to_i
+  walltime = (bc_num_hours.to_i * 60)
+%>
+---
+batch_connect:
+  template: basic
+  websockify_cmd: '/usr/bin/websockify'
+  script_wrapper: |
+    module purge
+    module load singularity
+    cat << "CTRSCRIPT" > container.sh
+    export PATH="$PATH:/opt/TurboVNC/bin"
+    %s
+    CTRSCRIPT
+
+    WORKDIR=/projects/a9009/sbc538/Projects/ChatBot/haystack_annotation/postgres/
+    DATADIR=${WORKDIR}/var/lib/postgresql/data
+    LOGDIR=${WORKDIR}/var/log/postgresql/
+    RUNDIR=${WORKDIR}/var/run/postgresql/
+
+    mkdir -p ${DATADIR}
+    mkdir -p ${LOGDIR}
+    mkdir -p ${RUNDIR}
+
+    # Export useful connection variables
+    export host
+    export port
+
+    # Generate a connection yaml file with given parameters
+    create_yml () {
+      echo "Generating connection YAML file..."
+      (
+        umask 077
+        echo -e "host: $host\nport: $port\npassword: $password" > "/home/sbc538/ondemand/data/sys/dashboard/batch_connect/dev/quest_ood_haystack_annotation/output/1d0795e6-1849-4581-ba86-35d14e5160ee/connection.yml"
+      )
+    }
+
+    # Cleanliness is next to Godliness
+    clean_up () {
+      echo "Cleaning up..."
+      [[ -e "/home/sbc538/ondemand/data/sys/dashboard/batch_connect/dev/quest_ood_haystack_annotation/output/1d0795e6-1849-4581-ba86-35d14e5160ee/clean.sh" ]] && source "/home/sbc538/ondemand/data/sys/dashboard/batch_connect/dev/quest_ood_haystack_annotation/output/1d0795e6-1849-4581-ba86-35d14e5160ee/clean.sh"
+      [[ ${SCRIPT_PID} ]] && pkill -P ${SCRIPT_PID} || :
+      pkill -P $$
+      exit ${1:-0}
+    }
+
+    # Source in all the helper functions
+    source_helpers () {
+      # Generate random integer in range [$1..$2]
+      random_number () {
+        shuf -i ${1}-${2} -n 1
+      }
+      export -f random_number
+
+      port_used_python() {
+        python -c "import socket; socket.socket().connect(('$1',$2))" >/dev/null 2>&1
+      }
+
+      port_used_python3() {
+        python3 -c "import socket; socket.socket().connect(('$1',$2))" >/dev/null 2>&1
+      }
+
+      port_used_nc(){
+        nc -w 2 "$1" "$2" < /dev/null > /dev/null 2>&1
+      }
+
+      port_used_lsof(){
+        lsof -i :"$2" >/dev/null 2>&1
+      }
+
+      port_used_bash(){
+        local bash_supported=$(strings /bin/bash 2>/dev/null | grep tcp)
+        if [ "$bash_supported" == "/dev/tcp/*/*" ]; then
+          (: < /dev/tcp/$1/$2) >/dev/null 2>&1
+        else
+          return 127
+        fi
+      }
+
+      # Check if port $1 is in use
+      port_used () {
+        local port="${1#*:}"
+        local host=$((expr "${1}" : '\(.*\):' || echo "localhost") | awk 'END{print $NF}')
+        local port_strategies=(port_used_nc port_used_lsof port_used_bash port_used_python port_used_python3)
+
+        for strategy in ${port_strategies[@]};
+        do
+          $strategy $host $port
+          status=$?
+          if [[ "$status" == "0" ]] || [[ "$status" == "1" ]]; then
+            return $status
+          fi
+        done
+
+        return 127
+      }
+      export -f port_used
+
+      # Find available port in range [$2..$3] for host $1
+      # Default: [2000..65535]
+      find_port () {
+        local host="${1:-localhost}"
+        local port=$(random_number "${2:-2000}" "${3:-65535}")
+        while port_used "${host}:${port}"; do
+          port=$(random_number "${2:-2000}" "${3:-65535}")
+        done
+        echo "${port}"
+      }
+      export -f find_port
+
+      # Wait $2 seconds until port $1 is in use
+      # Default: wait 30 seconds
+      wait_until_port_used () {
+        local port="${1}"
+        local time="${2:-30}"
+        for ((i=1; i<=time*2; i++)); do
+          port_used "${port}"
+          port_status=$?
+          if [ "$port_status" == "0" ]; then
+            return 0
+          elif [ "$port_status" == "127" ]; then
+             echo "commands to find port were either not found or inaccessible."
+             echo "command options are lsof, nc, bash's /dev/tcp, or python (or python3) with socket lib."
+             return 127
+          fi
+          sleep 0.5
+        done
+        return 1
+      }
+      export -f wait_until_port_used
+
+      # Generate random alphanumeric password with $1 (default: 8) characters
+      create_passwd () {
+        tr -cd 'a-zA-Z0-9' < /dev/urandom 2> /dev/null | head -c${1:-8}
+      }
+      export -f create_passwd
+    }
+    export -f source_helpers
+
+    source_helpers
+
+    # Set host of current machine
+    host=$(hostname)
+    port=$(find_port ${host} 5432 5432  )
+
+    singularity run --env POSTGRES_USER="somesafeuser" --env POSTGRES_PASSWORD="somesafepassword" --env POSTGRES_DB="databasename" -B ${DATADIR}:/var/lib/postgresql/data -B ${LOGDIR}:/var/log/postgresql/ -B ${RUNDIR}:/var/run/postgresql/ /projects/a9009/sbc538/Projects/ChatBot/postgres_12.sif > postgressql.log 2>&1 &
+    SCRIPT_PID=$!
+
+    echo "Waiting for PostGresSQL to open port ${port}..."
+    echo "TIMING - Starting wait at: $(date)"
+    if wait_until_port_used "${host}:${port}" 120; then
+      echo "Discovered PostGresSQL listening on port ${port}!"
+      echo "TIMING - Wait ended at: $(date)"
+    else
+      echo "Timed out waiting for PostGresSQL to open port ${port}!"
+      echo "TIMING - Wait ended at: $(date)"
+      pkill -P ${SCRIPT_PID}
+      clean_up 1
+    fi
+    sleep 2
+
+    singularity exec --env BASE_URI="/rnode/${host}/7001/" --env NODE_ENV="production" --env DB_HOSTNAME="localhost" --env DB_PASSWORD="somesafepassword" --env DB_USERNAME="somesafeuser" --env DB_NAME="databasename"  --env JWT_SECRET="somesafesecret" --env DOMAIN_WHITELIST="*" --env COOKIE_KEYS="somesafecookiekeys"  --env DEFAULT_ADMIN_PASSWORD="DEMO_PASSWORD"  --env DEFAULT_ADMIN_EMAIL="example@example.com" -B /projects/a9009/sbc538/Projects/ChatBot/app:/app /projects/a9009/sbc538/Projects/ChatBot/haystack-annotation_latest.sif /bin/bash container.sh
+
+  header: | 
+    #!/bin/bash
+        . ~/.bashrc
+
+script:
+   <%- if user_email != "" %>
+   email_on_started: true
+   <%- end %>
+   native:
+     # What partition is the user submitting to
+     - "--partition"
+     - "<%= slurm_partition %>"
+     # Under what account is the user submitting this job
+     - "--account"
+     - "<%= slurm_account %>"
+     # How much time (in hours)
+     - "--time"
+     - "<%= walltime %>"
+     # How many nodes (always 1)
+     <%- if number_of_nodes != "" %>
+     - "--nodes"
+     - "<%= number_of_nodes %>"
+     <%- else %>
+     - "--nodes"
+     - "1"
+     <%- end %>
+     # How many CPUs
+     - "--ntasks-per-node"
+     - "<%= ppn %>"
+     # How much memory
+     - "--mem"
+     - "<%= memory_per_node %>G"
+     # Always run on qnode0372
+     - "--nodelist"
+     - "qnode0372"
+     # Job Name
+     - "--job-name"
+     - "<%= job_name %>"
+     # If the user supplies an e-mail, then they will get an e-mail when the job begins
+     <%- if user_email != "" %>
+     - "--mail-user"
+     - "<%= user_email %>"
+     <%- end %>
+     # If the user requested a GPU, then we need to add this argument to our job submit command
+     <%- if gres_value != "" %>
+     - "--gres"
+     - "<%= gres_value %>"
+     <%- end %>
